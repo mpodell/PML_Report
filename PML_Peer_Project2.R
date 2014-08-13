@@ -77,24 +77,32 @@ naf <- function( z, y ) {
   if (is.na(y)) { z <- 1 } else { z <- 0 }
 }
 addDummy <- function (v) {
-  if(sum(is.na(v) == 0)) { stop 
-    } else {
+  if(sum(is.na(v) > 0)) { 
     vmedian <- median(v, na.rm = TRUE)
-    d <- numeric(length(v))
-    d <- sapply(length(v), function(i) {
-      if(is.na(v[i])) {
-        v[i] <- vmedian
-        d[i] <- 1
-      } else {
-        d[i] <-0
-      }
-    })
-#     print(d)
-    dvar <- as.data.frame(d)
-#     newName <- paste (v, "_isna", sep = "")
-#     names(dvar) <- newName
     
-    return(dvar)
+    d = numeric(length(v))
+    c = numeric(length(v))
+  
+  addmedian <- function (a, b) {}
+    c <- sapply(c, function(i) {
+      if(is.na(v[i])) {
+        c[i] <- vmedian
+      } else {
+        c[i] <- v[i]
+      }
+    }, v)
+      d <- sapply(d, function(i) {
+        if(is.na(v[i])) {
+          d[i] <- 1
+        } else {
+          d[i] <-0
+        }
+      }, v)
+    df <- cbind(c, d)
+    newName <- paste (names(v), "_isna", sep = "")
+    names(df) <- c( names(v), newName)
+    
+    return(df)
   }
 }
 trainT <- sapply(train, addDummy)
