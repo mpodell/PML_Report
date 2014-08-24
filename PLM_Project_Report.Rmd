@@ -1,0 +1,387 @@
+---
+title: "PML_Project_Report"
+author: "Michael O'Dell"
+date: "August 22, 2014"
+output: html_document
+---
+
+# Executive Summary
+This analysis uses the random forest algorithm to build three in-sample predictive models. The estimated out-of-sample error (Kappa) from those three models is the average of their in-sample errors: `0.8463`.
+
+The out-of-sample error (Kappa) of the last model (using 52 variables) predicted on a one-time use test set (separate from the 20 test cases) is `0.889`.
+
+# Project Objective
+This project is an exercise in predictive modeling. The goal is to predict the manner in which an exercise was performed for twenty observations in a test data set by creating a predictive model from a training data set and applying that model to the test data.
+
+# Process Overview
+The prediction process consists of five steps:
+
+1.  Question:   The goal of this project is to predict the manner in which subjects performed an exercise. 
+2.  Identify Appropriate Data: The data for this project has been provided as part of the assignment.
+3.  Select/Create Features: Identify and/or create covariants that best explain the outcome variable.
+4.  Identify Algorithms:  Choose the appropriate modeling algorithm given the features
+5.  Estimate Parameters:  Estimate the prediction parameters based on the selected algorithm
+6.  Evaluate: Evaluate the algorithm on new data.
+
+##  Question:
+###  Background
+Using devices such as Jawbone Up, Nike FuelBand, and Fitbit it is now possible to collect a large amount of data about personal activity.This data is often used to quantify how much of a particular activity they do, but rarely used quantify how well the activity is done.
+
+This project examines data collected from participants correctly and incorrectly executing a specific exercise. Four axis inertial measurement units (IMUs) located on the belt, armband, glove, and dumbbell measured three-axis acceleration, gyroscopic, and magnetometer data while 6 participants conducted 10 repetitions using five standardized forms (one correct and four inccorrect) of the Unilateral Dumbbell Bicept Curl. More information is available from the website here: http://groupware.les.inf.puc-rio.br/har (see the section on the Weight Lifting Exercise Dataset). 
+
+
+```{r read_test_sample, echo=FALSE, warning=FALSE, results='hide', message=FALSE}
+
+require(caret)
+require(RANN)
+require(ggplot2)
+require(ggdendro)
+require(reshape2)
+require(plyr)
+
+#####
+##### READ THE DATA INTO R
+#####
+nastrings <- c( "NA", "", "#DIV/0!" )
+modelingData <- read.table("data/training.csv", header = TRUE, sep = ",", na.strings = nastrings)
+finalTest <- read.table("data/testing.csv", header = TRUE, sep = ",", na.strings = nastrings)
+
+modelingData$num_window <- as.factor(modelingData$num_window)
+
+#####
+##### CREATE TRAINING, TEST, AND VALIDATION SETS
+#####
+
+set.seed(1984)
+n <- round(0.5*length(levels(modelingData$num_window)))
+tsample <- sample(as.numeric(levels(modelingData$num_window)), n)
+training <- modelingData[modelingData$num_window %in% tsample,]
+training <- transform(training, num_window = factor(num_window))
+str(training$num_window)
+testing <- modelingData[!(modelingData$num_window %in% tsample),]
+testing <- transform(testing, num_window = factor(num_window))
+str(testing$num_window)
+
+# Split testing into test1 and test2 (test1 will be the test set for the single obs models
+# test2 will be the test set for the time series models)
+# splitting along num_windows
+
+n <- round(0.5*length(levels(testing$num_window)))
+tsample <- sample(as.numeric(levels(testing$num_window)), n)
+test1 <- testing[testing$num_window %in% tsample,]
+test1 <- transform(test1, num_window = factor(num_window))
+str(test1$num_window)
+test2 <- testing[!(testing$num_window %in% tsample),]
+test2 <- transform(test2, num_window = factor(num_window))
+str(test2$num_window)
+
+# Split test1 into test1a and test1b so that test1b can be "final" test for single obs model and
+# test1a can be the repeated test for examining training models.
+# splitting randomly
+
+inTest1a <- createDataPartition(y=test1$classe, p=0.5, list=FALSE)
+test1a <- test1[inTest1a,]
+test1b <- test1[-inTest1a,]
+
+
+```
+
+##  Data
+The data consists of four sets of 38 sensor variables (one set for each IMU) plus an additional 8 variables that include an observation index, three time stamps, a sliding time-series data sample window flag (does the observation start a new time-series of observations), a time-series data sample index, and for the training data, a class variable indicating which of the 5 forms in which the exercies was conducted.
+
+Of the 38 sensor variables, 
+* Nine are the raw three-axis (x,y,z) data from the three IMU sensors
+* Three more are the calculated Euler Angles from the raw data (pitch, roll, yaw)
+* 24 are eight features calculated on the Euler Angles over the all of observations in a given data sample (average, standard deviation, variance, maximum, minimum, amplitude, skewness, and kurtosis)
+* The remaining two variables are the total acceleration calculated for each observation from the three-axis accelerometer data and the total accerlation variance calculated over the time window.
+
+Count of NAs:
+```{r data_review, echo = FALSE}
+total_NAs <- as.data.frame(colSums(is.na(training)))
+names(total_NAs) <- c("Count_of_NAs")
+total_NAs$count <- rep(1, nrow(total_NAs))
+NAsums <- ddply(total_NAs,.(Count_of_NAs),summarize,sum=sum(count))
+NAsums$percent_NAs <- sprintf("%1.2f%%", as.numeric(NAsums$Count_of_NAs)/nrow(training))
+names(NAsums)<- c("Obs_missing_data", "Count_of_Variables", "Percent_NAs")
+t(NAsums)
+```
+Upon inspection, over 98% of the derived time-series observations are missing, and while they can be calculated since the observations have a time-series index (num_window), this poses a potential problem for the prediction of the test set part of the assignment.
+
+Per the assingment instructions, the test set consists of twenty observations and the assignment is to predict the class of each observation--thus implying that some, if not all, of the test observations are not part of a time-series and thus for which time-series variables cannot be calculated.
+
+To account for both possiblities, isolated observations and observations from a single time-series, models will be tested with and without those variables.
+
+To do this, the provided training set is split into a training and test set by sampling complete time-series window indexes (keeping series together). The test set is then split into two sub-test sets (test1 for validating a models without time-series features and test2 to validate a model with time-series features). Test1 is randomly subsetted to create a test (test1a) and validation (test1b) set, thus allowing for out of sample error to be calculated for both a model with and a model without time-series features.
+
+## Exploratory Plots
+
+Plotting density (histogram) plots for the 52 non time-series variables (9 three-axis, 3 Euler Angles + total acceleartion for four IMUs) data for a single user reveals a few variables with distributions close to normal, but no clear mean separation between outcomes for any variables. Including all users shows all variables are multi-modal suggesting that parametric modeling will not be effective.
+
+```{r visualize, echo=FALSE, cache=TRUE, warning=FALSE, fig.width = 12, fig.height = 12}
+#####
+##### remove nzv variables
+#####
+
+nzvT <- nearZeroVar(training)
+train_nzvR <- training [, -nzvT]
+
+# remove the timestamps, and window variables for the time being
+train_nzv_nf <- train_nzvR[, -c(3:6)]
+
+# find the high count NA variables and remove them 
+highNA <- colSums(is.na(train_nzv_nf))
+
+h_id <- grep("^0", highNA)
+train_nzv_nf_nna <- train_nzv_nf[, h_id]
+
+# scale the 52 sensor variables for better viewing
+s.df <- as.data.frame(apply(train_nzv_nf_nna[,-c(1,2, 55)], 2, function(x) {
+  (x-mean(x))/sd(x)
+}))
+
+# add back index and classe
+s.df$X <- train_nzv_nf_nna$X
+s.df$classe <- train_nzv_nf_nna$classe
+
+s.m <- melt(s.df, id = c("X", "classe"))
+s <- ggplot(data = s.m, aes(x=value)) + geom_density(aes(color=classe, alpha = 0.4))
+s <- s + facet_wrap( ~ variable)
+s <- s + scale_x_continuous(limits=c(-2.5, 2.5)) + ggtitle("Density Plots for Selected Variables\n(all variables centered and scaled)")
+s
+
+
+```
+
+
+##  Imputing Data and/or New Covariants
+Given that the 52 sensor variables have no missing values, there is no need to imput data for them. However, if these 52 variables do not yeild a set of factors sufficient to build a good predictive model, new covarients (such total gyros and total magnet--similar to the included total acceleration) will need to be calculated.
+
+## Factor selection
+Since none of the variables have clear separation of outcome means, K-means clustering may be helpful. Calculating clusters for 30 centers and multiple restarts produces no clear distinction between classes with the exception of class A for which variables: magnet_belt_y, magnet_arm_z, magnet_dumbbell_y, and magnet_forearem_y look to play a major role.
+
+```{r k-means_1, echo=FALSE, cache=TRUE}
+
+k1 <- kmeans(train_nzv_nf_nna[, -c(1,2,55)], centers = 30, nstart = 10)
+table(k1$cluster, train_nzv_nf_nna$classe)
+plot(k1$center[17, ], pch = 19, ylab = "cluster center", xlab = "variable(index)", main = "Plot of Variable Importance in Cluster 17")
+text(k1$center[17, ] + 100, labels = as.character(3:54))
+```
+
+Adding additional covarients calculable for single observations, (total acceleration (dropping the existing total_accel variables since they are an order of magnitude smaller than the actual total acceleration), total gyro, and total magnet vector magnitudes calculated using the formula:
+
+$$ Total_{ vector mag} = \sqrt{x^2 + y^2 + z^2} $$
+
+for all IMUs yields 12 additional variables, but produce no better results when clustering. 
+```{r k-means_2, echo=FALSE, cache=TRUE}
+
+vector <- function(df) {
+  apply(df, 1, function (x) {sqrt(x[1]^2 + x[2]^2 + x[3]^2)})
+}
+
+# add vector magnitude covariants. Need to find a programmatic way of doing this rather than by hand.
+b_accel <- train_nzv_nf_nna[, c("accel_belt_x", "accel_belt_y", "accel_belt_z")]
+a_accel <- train_nzv_nf_nna[, c("accel_arm_x", "accel_arm_y", "accel_arm_z")]
+d_accel <- train_nzv_nf_nna[, c("accel_dumbbell_x", "accel_dumbbell_y", "accel_dumbbell_z")]
+f_accel <- train_nzv_nf_nna[, c("accel_forearm_x", "accel_forearm_y", "accel_forearm_z")]
+
+b_gyro <- train_nzv_nf_nna[, c("gyros_belt_x", "gyros_belt_y", "gyros_belt_z")]
+a_gyro <- train_nzv_nf_nna[, c("gyros_arm_x", "gyros_arm_y", "gyros_arm_z")]
+d_gyro <- train_nzv_nf_nna[, c("gyros_dumbbell_x", "gyros_dumbbell_y", "gyros_dumbbell_z")]
+f_gyro <- train_nzv_nf_nna[, c("gyros_forearm_x", "gyros_forearm_y", "gyros_forearm_z")]
+
+b_mag <- train_nzv_nf_nna[, c("magnet_belt_x", "magnet_belt_y", "magnet_belt_z")]
+a_mag <- train_nzv_nf_nna[, c("magnet_arm_x", "magnet_arm_y", "magnet_arm_z")]
+d_mag <- train_nzv_nf_nna[, c("magnet_belt_x", "magnet_dumbbell_y", "magnet_dumbbell_z")]
+f_mag <- train_nzv_nf_nna[, c("magnet_belt_x", "magnet_forearm_y", "magnet_forearm_z")]
+
+bav <- vector(b_accel)
+aav <- vector(a_accel)
+dav <- vector(d_accel)
+fav <- vector(f_accel)
+
+bgv <- vector(b_gyro)
+agv <- vector(a_gyro)
+dgv <- vector(d_gyro)
+fgv <- vector(f_gyro)
+
+bmv <- vector(b_mag)
+amv <- vector(a_mag)
+dmv <- vector(d_mag)
+fmv <- vector(f_mag)
+
+imu_vars <- c("belt_accel_magnitude", "arm_accel_magnitude", "dumbbell_accel_magnitude", "forearm_accel_magnitude",
+              "belt_gyro_magnitude", "arm_gyro_magnitude", "dumbbell_gyro_magnitude", "forearm_gyro_magnitude",
+              "belt_magnet_magnitude", "arm_magnet_magnitude", "dumbbell_magnet_magnitude", "forearm_magnet_magnitude")
+
+imu <- data.frame( cbind(
+  bav,
+  aav,
+  dav,
+  fav,
+  
+  bgv,
+  agv,
+  dgv,
+  fgv,
+  
+  bmv,
+  amv,
+  dmv,
+  fmv
+))
+
+names(imu) <- imu_vars
+
+train_nzv_nf_nna_mags <- cbind( train_nzv_nf_nna[, -c(6,17,32,45)], imu)
+
+# recluster
+k2 <- kmeans(train_nzv_nf_nna_mags[, -c(1,2,51)], centers = 30, nstart = 10)
+# table(k7$cluster, train_nzv_nf_nna$classe)  # no better results
+
+```
+
+Noting the four variables identified for class A through clusting and visual inspection of density distributions suggests a first cut set of feature variables:
+
+```{r features20}
+
+f20 <- c(
+"magnet_belt_y",
+"magnet_arm_z",
+"magnet_dumbbell_y",
+"magnet_forearm_y",
+"magnet_forearm_z",
+"yaw_belt",
+"total_accel_belt",
+"gyros_arm_z",
+"gyros_dumbbell_y",
+"accel_dumbbell_x",
+"roll_dumbbell",
+"yaw_dumbbell",
+"magnet_dumbbell_z",
+"accel_forearm_x",
+"accel_dumbbell_z",
+"magnet_belt_x",
+"pitch_belt",
+"magnet_forearm_x",
+"accel_dumbbell_x",
+"accel_dumbbell_y"
+)
+```
+
+## Algorithm
+
+Given the non-normal distributions of the data, the non-parametric Random Forest may yield the best results. Random Forests do not require pre-processing other than removal of NAs and the data set of 52 variables is free of NAs.
+
+```{r rf20, echo=FALSE, cache=TRUE}
+f20l <- sapply(f20, grep, names(train_nzv_nf_nna))
+fs20 <- train_nzv_nf_nna[, f20l]
+fs20$classe <- train_nzv_nf_nna$classe
+modFitRF20 <- train(classe ~., data = fs20, method = "rf")
+
+# preprocess the test data in the same way the training data was preprocessed.
+
+# remove the near zero variance variables
+test1a_nzv <- test1a [, -nzvT]
+
+# remove the timestamps, and window variables
+test1a_nzv_nf <- test1a_nzv[, -c(3:6)]
+
+# remove the high count NA variables
+test1a_nzv_nf_nna <- test1a_nzv_nf[, h_id]
+
+# select the f20 variables
+test1a_fs20 <- test1a_nzv_nf_nna[, f20l]
+
+# generate predictions
+t1a_fs20_preds <- predict(modFitRF20, newdata = test1a_fs20)
+
+cmfs20 <- confusionMatrix(t1a_fs20_preds, test1a$classe)
+cmfs20$overall
+
+```
+
+Given that the model must correctly predict 20 observations, this model will likely miss 2 (or more likely 3 given that in-sample error is optimistic). A 2nd feature set of just the three-axis data (36 variables) is worse.
+
+```{r rf36, echo=FALSE, cache=TRUE}
+three <- c("x$", "y$", "z$")
+f36l <- sapply(three, grep, names(train_nzv_nf_nna))
+fs36 <- train_nzv_nf_nna[, f36l]
+fs36$classe <- train_nzv_nf_nna$classe
+modFitRF36 <- train(classe ~., data = fs36, method = "rf")
+
+# select the f36 variables
+test1a_fs36 <- test1a_nzv_nf_nna[, f36l]
+
+# generate predictions
+t1a_fs36_preds <- predict(modFitRF36, newdata = test1a_fs36)
+
+cmfs36 <- confusionMatrix(t1a_fs36_preds, test1a$classe)
+cmfs36$overall
+```
+
+Absent the including time-series variables such as minimum, maximum, variance, mean, etc. the kitchen sink feature set of all 52 non time-series variables is the best bet although risks over fitting the data.
+
+```{r kitchen_sink, echo=FALSE, cache=TRUE}
+
+fs52 <- train_nzv_nf_nna[, -c(1,2)]
+modFitRF52 <- train(classe ~., data = fs52, method = "rf")
+
+# select the f52 variables
+test1a_fs52 <- test1a_nzv_nf_nna[, -c(1,2,55)]
+
+# generate predictions
+t1a_fs52_preds <- predict(modFitRF52, newdata = test1a_fs52)
+
+cmfs52 <- confusionMatrix(t1a_fs52_preds, test1a$classe)
+cmfs52$overall
+```
+
+
+
+```{r out_of_sample_error estimate, echo=FALSE, cache=TRUE}
+# in-sample error. average the errors for the three prediction models on test1a
+
+cmfs20
+cmfs36
+cmfs52
+
+ave_error <- data.frame(model = c("modFitRF20", "modFitRF36", "modFitRF52"), kappa = c(0.854, 0.815, 0.87))
+```
+
+The estimated out-of-sample error using the in-sample errors of the three cross validated models is the average of their indvidual errors. In this case, using the concordance error measure Kappa, the estimated out-of-sample error is `r mean(ave_error$kappa)`.
+
+```{r}
+
+```{r out_of_sample_error, echo=FALSE, cache=TRUE}
+# preprocess the test1b data in the same way the training data was preprocessed.
+
+# remove the near zero variance variables
+test1b_nzv <- test1b [, -nzvT]
+
+# remove the timestamps, and window variables
+test1b_nzv_nf <- test1b_nzv[, -c(3:6)]
+
+# remove the high count NA variables
+test1b_nzv_nf_nna <- test1b_nzv_nf[, h_id]
+
+# select the f20 variables
+test1b_fs52 <- test1b_nzv_nf_nna[, -c(1,2,55)]
+
+# generate predictions
+t1b_fs52_preds <- predict(modFitRF52, newdata = test1b_fs52)
+
+cmfsF52 <- confusionMatrix(t1b_fs52_preds, test1b$classe)
+cmfsF52$overall
+
+cmfsF52
+```
+The out of sample error for the final model using 52 variables is `0.889`.
+
+
+## Time-series Features
+
+Given that the data observations are time series, there is significant information in the sequence of observations as defined by the `num_window` variable. While the 20 test cases for the single observations and cannot be pre-processed to create variables such as mean, variance, standard deviation, maximum, minimum, when initially sampling test sets from the training data, I sampled a test set by `num_window`. With this test set, one can test the effect of including some time series variables. 
+
+And while modeling with these time-series variables is outside the scope of this assignment, the power of such variables can be seen in the fact that the researchers who collected this data, created a random forest predictive model with only 17 time-series variables with a much higher sensitivity.
+
+
